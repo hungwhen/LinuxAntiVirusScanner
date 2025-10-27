@@ -13,12 +13,12 @@ def hash_all(root='/'):
   for dirpath, _, filenames in os.walk(root):
     for name in filenames:
       fpath = os.path.join(dirpath,name)
-        try:
-          digest = blake2b_file(fpath, size=64)
-          print(f"{digest} {fpath}")
-        except Exception:
-          # skip files with some kind of error silently :)
-          pass
+      try:
+        digest = blake2b_file(fpath, size=64)
+        print(f"{digest} {fpath}")
+      except Exception:
+        # skip files with some kind of error silently :)
+        pass
 
 if __name__ == '__main__':
   hash_all('/')
