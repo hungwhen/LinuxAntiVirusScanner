@@ -10,33 +10,22 @@ HEARTBEAT_SEC = 5.0
 DEBUG_LOG = "debug_output.log"
 HASH_FILE = "hashes.txt"
 
-# Filesystem types we’ll skip (pseudo/virtual or problematic for hashing)
 SKIP_FS_TYPES = {
     "proc","sysfs","devtmpfs","devpts","tmpfs","hugetlbfs",
     "cgroup","cgroup2","configfs","fusectl","debugfs","securityfs",
     "pstore","bpf","tracefs","ramfs","autofs","sockfs","pipefs",
-    "overlay",      # often Docker/containers
-    "squashfs",     # snaps / app images (optional to skip)
-    "nsfs","binfmt_misc","rpc_pipefs","mqueue","zramfs","zsmalloc"
+    "overlay","squashfs","nsfs","binfmt_misc","rpc_pipefs","mqueue","zramfs","zsmalloc"
 }
-# If a type starts with any of these prefixes, skip as well
 SKIP_FS_PREFIXES = ("cgroup", "fuse.", "fusectl")
-
 # ----------------
 
+
 def load_mounts_to_skip():
-    """
-    Parse /proc/self/mountinfo (preferred) or /proc/mounts and
-    return a list of mountpoints to skip, based on SKIP_FS_TYPES/ prefixes.
-    """
     mounts = []
     path = "/proc/self/mountinfo" if os.path.exists("/proc/self/mountinfo") else "/proc/mounts"
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                # mountinfo format:
-                # ID parent major:minor root mountpoint options - fstype source superopts
-                # We split on " - " first to get fstype reliably.
                 if path.endswith("mountinfo"):
                     try:
                         left, right = line.strip().split(" - ", 1)
@@ -46,7 +35,6 @@ def load_mounts_to_skip():
                     except Exception:
                         continue
                 else:
-                    # /proc/mounts: <source> <mountpoint> <fstype> ...
                     parts = line.split()
                     if len(parts) < 3:
                         continue
@@ -56,23 +44,25 @@ def load_mounts_to_skip():
                     mounts.append(os.path.abspath(mountpoint))
     except Exception:
         pass
+    return sorted(set(mounts), key=lambda p: (-len(p), p))
 
-    # Sort longest-first so child mounts match before parents
-    mounts = sorted(set(mounts), key=lambda p: (-len(p), p))
-    return mounts
 
 def path_on_skipped_mount(path, skip_mounts):
-    # Quick check whether path is under any skipped mountpoint
     ap = os.path.abspath(path)
     for m in skip_mounts:
         if ap == m or ap.startswith(m + os.sep):
             return True
     return False
 
+
 def teeprint(*args, **kw):
     msg = " ".join(str(a) for a in args)
-    print(msg, flush=True, **kw)
     print(msg, file=logfile, flush=True, **kw)
+
+
+def progress_print(msg, end="\n"):
+    print(msg, end=end, flush=True)
+
 
 def is_regular_file(path):
     try:
@@ -80,6 +70,17 @@ def is_regular_file(path):
         return stat.S_ISREG(st.st_mode)
     except OSError:
         return False
+
+
+# --- Placeholder function (you’ll replace this later) ---
+def check_hash(digest: str):
+    """
+    Placeholder for future logic.
+    Returns (boolean, reason).
+    """
+    return False, "DUMMY_REASON"
+# --------------------------------------------------------
+
 
 def blake2b_file(path, size=64):
     pid = os.getpid()
@@ -98,6 +99,7 @@ def blake2b_file(path, size=64):
         traceback.print_exc(file=logfile)
         return None
 
+
 def hash_one(args):
     path, skip_mounts = args
     pid = os.getpid()
@@ -113,6 +115,7 @@ def hash_one(args):
 
     digest = blake2b_file(path)
     return (path, digest)
+
 
 def hash_all(root='/', out_file=HASH_FILE, workers=None):
     if workers is None:
@@ -133,13 +136,7 @@ def hash_all(root='/', out_file=HASH_FILE, workers=None):
         nonlocal last_heartbeat
         now = time.monotonic()
         if now - last_heartbeat >= HEARTBEAT_SEC:
-            inflight = len(futures)
-            sample = [getattr(f, "_path", None) for f in futures[:5]]
-            teeprint(f"[HEARTBEAT] done={done} errors={errors} submitted={submitted} inflight={inflight}")
-            if sample:
-                teeprint("[HEARTBEAT] sample in-flight:")
-                for s in sample:
-                    teeprint("   -", s)
+            progress_print(f"[PROGRESS] done={done} errors={errors} submitted={submitted} inflight={len(futures)}")
             last_heartbeat = now
 
     def drain(n=None):
@@ -153,13 +150,14 @@ def hash_all(root='/', out_file=HASH_FILE, workers=None):
                 pass
             path, digest = fut.result()
             if digest:
-                out.write(f"{digest} {path}\n")
+                boolean, reason = check_hash(digest)
+                out.write(f"{digest} {'TRUE' if boolean else 'FALSE'} {reason}\n")
             else:
                 errors += 1
             done += 1
             if done % PROGRESS_EVERY == 0:
                 out.flush()
-                teeprint(f"[PROGRESS] {done} done ({errors} errors, {submitted} submitted)")
+                progress_print(f"[PROGRESS] {done} done ({errors} errors, {submitted} submitted)")
             count += 1
             if n is not None and count >= n:
                 break
@@ -185,18 +183,18 @@ def hash_all(root='/', out_file=HASH_FILE, workers=None):
 
                 heartbeat()
 
-        teeprint(f"[INFO] submission complete. draining remaining {len(futures)} futures…")
+        progress_print(f"[INFO] submission complete. draining remaining {len(futures)} futures…")
         drain()
         out.flush()
 
-    teeprint(f"[DONE] submitted={submitted} ok={done - errors} errors={errors}")
+    progress_print(f"[DONE] submitted={submitted} ok={done - errors} errors={errors}")
     return 0
+
 
 if __name__ == '__main__':
     with open(DEBUG_LOG, 'w', encoding='utf-8') as logfile:
         root = sys.argv[1] if len(sys.argv) > 1 else '/'
         outp = sys.argv[2] if len(sys.argv) > 2 else HASH_FILE
         hash_all(root, outp)
-    print(f"All debug output saved to {DEBUG_LOG}")
-    print(f"Hashes saved to {HASH_FILE}")
-
+    print(f"[INFO] Detailed logs: {DEBUG_LOG}")
+    print(f"[INFO] Hashes written (digest + boolean + reason) to: {HASH_FILE}")
