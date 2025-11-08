@@ -39,7 +39,6 @@ def load_mounts_to_skip():
                     if len(parts) < 3:
                         continue
                     mountpoint, fstype = parts[1], parts[2]
-
                 if (fstype in SKIP_FS_TYPES) or any(fstype.startswith(pfx) for pfx in SKIP_FS_PREFIXES):
                     mounts.append(os.path.abspath(mountpoint))
     except Exception:
@@ -72,27 +71,20 @@ def is_regular_file(path):
         return False
 
 
-# --- Placeholder function (you’ll replace this later) ---
 def check_hash(digest: str):
-    """
-    Placeholder for future logic.
-    Returns (boolean, reason).
-    """
+    """Placeholder for future logic."""
     return False, "DUMMY_REASON"
-# --------------------------------------------------------
 
 
 def blake2b_file(path, size=64):
     pid = os.getpid()
     teeprint(f"[WORKER {pid}] OPENING: {path}")
     h = hashlib.blake2b(digest_size=size)
-    bytes_read = 0
     try:
         with open(path, 'rb') as f:
             for b in iter(lambda: f.read(CHUNK), b''):
                 h.update(b)
-                bytes_read += len(b)
-        teeprint(f"[WORKER {pid}] DONE: {path} read={bytes_read} bytes")
+        teeprint(f"[WORKER {pid}] DONE: {path}")
         return h.hexdigest()
     except Exception as e:
         teeprint(f"[WORKER {pid}] ERROR {path}: {e}")
@@ -106,15 +98,34 @@ def hash_one(args):
     teeprint(f"[WORKER {pid}] START {path}")
 
     if path_on_skipped_mount(path, skip_mounts):
-        teeprint(f"[WORKER {pid}] SKIP (skipped fs mount): {path}")
+        teeprint(f"[WORKER {pid}] SKIP (mount): {path}")
         return (path, None)
-
     if not is_regular_file(path):
         teeprint(f"[WORKER {pid}] SKIP (not regular): {path}")
         return (path, None)
 
-    digest = blake2b_file(path)
-    return (path, digest)
+    return (path, blake2b_file(path))
+
+
+def load_existing_hashes(hash_file_path):
+    """Load all existing hashes into a dict: digest -> (bool_str, reason_str)."""
+    known = {}
+    if not os.path.exists(hash_file_path):
+        return known
+
+    try:
+        with open(hash_file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(" ", 2)
+                if not parts:
+                    continue
+                digest = parts[0]
+                bool_str = parts[1] if len(parts) > 1 else ""
+                reason_str = parts[2] if len(parts) > 2 else ""
+                known[digest] = (bool_str, reason_str)
+    except Exception as e:
+        teeprint(f"[WARN] failed to load existing hashes: {e}")
+    return known
 
 
 def hash_all(root='/', out_file=HASH_FILE, workers=None):
@@ -123,12 +134,12 @@ def hash_all(root='/', out_file=HASH_FILE, workers=None):
 
     skip_mounts = load_mounts_to_skip()
     teeprint(f"[START] root={root} workers={workers}")
-    if skip_mounts:
-        teeprint("[SKIP] mountpoints:", *("  - " + m for m in skip_mounts), sep="\n")
 
-    submitted = 0
-    done = 0
-    errors = 0
+    known_hashes = load_existing_hashes(out_file)
+    loaded_count = len(known_hashes)
+    teeprint(f"[INFO] loaded {loaded_count} existing hashes")
+
+    submitted = done = errors = skipped_duplicates = new_hashes = 0
     futures = []
     last_heartbeat = time.monotonic()
 
@@ -136,12 +147,11 @@ def hash_all(root='/', out_file=HASH_FILE, workers=None):
         nonlocal last_heartbeat
         now = time.monotonic()
         if now - last_heartbeat >= HEARTBEAT_SEC:
-            progress_print(f"[PROGRESS] done={done} errors={errors} submitted={submitted} inflight={len(futures)}")
+            progress_print(f"[PROGRESS] done={done} errors={errors} dups={skipped_duplicates} new={new_hashes}")
             last_heartbeat = now
 
     def drain(n=None):
-        nonlocal done, errors
-        count = 0
+        nonlocal done, errors, skipped_duplicates, new_hashes
         snapshot = list(futures) if n is None else futures[:n]
         for fut in as_completed(snapshot):
             try:
@@ -150,44 +160,43 @@ def hash_all(root='/', out_file=HASH_FILE, workers=None):
                 pass
             path, digest = fut.result()
             if digest:
-                boolean, reason = check_hash(digest)
-                out.write(f"{digest} {'TRUE' if boolean else 'FALSE'} {reason}\n")
+                if digest in known_hashes:
+                    skipped_duplicates += 1
+                    teeprint(f"[SKIP] duplicate: {path}")
+                else:
+                    boolean, reason = check_hash(digest)
+                    bool_str = "TRUE" if boolean else "FALSE"
+                    out.write(f"{digest} {bool_str} {reason}\n")
+                    known_hashes[digest] = (bool_str, reason)
+                    new_hashes += 1
             else:
                 errors += 1
             done += 1
             if done % PROGRESS_EVERY == 0:
                 out.flush()
-                progress_print(f"[PROGRESS] {done} done ({errors} errors, {submitted} submitted)")
-            count += 1
-            if n is not None and count >= n:
+                progress_print(f"[PROGRESS] done={done} new={new_hashes} dup={skipped_duplicates}")
+            if n and done >= n:
                 break
 
     with ProcessPoolExecutor(max_workers=workers) as pool, \
          open(out_file, 'a', encoding='utf-8') as out:
 
         for dirpath, _, filenames in os.walk(root, followlinks=False):
-            teeprint(f"[SCAN] dir: {dirpath}")
             for name in filenames:
                 fpath = os.path.join(dirpath, name)
                 fut = pool.submit(hash_one, (fpath, skip_mounts))
-                setattr(fut, "_path", fpath)
                 futures.append(fut)
                 submitted += 1
 
-                if submitted % 500 == 0:
-                    teeprint(f"[INFO] submitted {submitted} files; inflight={len(futures)}")
-
                 if submitted % SUBMIT_BATCH == 0:
-                    teeprint(f"[INFO] submitted {submitted}; draining half of batch…")
                     drain(n=SUBMIT_BATCH // 2)
-
                 heartbeat()
 
-        progress_print(f"[INFO] submission complete. draining remaining {len(futures)} futures…")
         drain()
         out.flush()
 
-    progress_print(f"[DONE] submitted={submitted} ok={done - errors} errors={errors}")
+    progress_print(f"[DONE] submitted={submitted}, ok={done - errors}, errors={errors}")
+    progress_print(f"[SUMMARY] loaded={loaded_count}, new={new_hashes}, skipped_duplicates={skipped_duplicates}")
     return 0
 
 
@@ -197,4 +206,4 @@ if __name__ == '__main__':
         outp = sys.argv[2] if len(sys.argv) > 2 else HASH_FILE
         hash_all(root, outp)
     print(f"[INFO] Detailed logs: {DEBUG_LOG}")
-    print(f"[INFO] Hashes written (digest + boolean + reason) to: {HASH_FILE}")
+    print(f"[INFO]
