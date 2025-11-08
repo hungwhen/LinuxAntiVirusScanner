@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, stat, time, hashlib, traceback
+import os, sys, stat, time, hashlib, traceback, math, collections
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # --- Settings ---
@@ -9,6 +9,8 @@ SUBMIT_BATCH = 5000
 HEARTBEAT_SEC = 5.0
 DEBUG_LOG = "debug_output.log"
 HASH_FILE = "hashes.txt"
+ENTROPY_THRESHOLD = 7.5  # bits/byte threshold for "suspicious"
+# ----------------
 
 SKIP_FS_TYPES = {
     "proc","sysfs","devtmpfs","devpts","tmpfs","hugetlbfs",
@@ -17,7 +19,6 @@ SKIP_FS_TYPES = {
     "overlay","squashfs","nsfs","binfmt_misc","rpc_pipefs","mqueue","zramfs","zsmalloc"
 }
 SKIP_FS_PREFIXES = ("cgroup", "fuse.", "fusectl")
-# ----------------
 
 
 def load_mounts_to_skip():
@@ -71,9 +72,38 @@ def is_regular_file(path):
         return False
 
 
-def check_hash(digest: str):
-    """Placeholder for future logic."""
-    return False, "DUMMY_REASON"
+# --- Entropy computation ---
+def compute_entropy(path):
+    """Compute Shannon entropy for a file."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None
+
+    if not data:
+        return 0.0
+
+    counts = collections.Counter(data)
+    length = len(data)
+    ent = 0.0
+    for count in counts.values():
+        p = count / length
+        ent -= p * math.log2(p)
+    return ent
+
+
+def check_hash(path, digest):
+    """Evaluate hash reason based on file entropy."""
+    ent = compute_entropy(path)
+    if ent is None:
+        return False, "ENTROPY_ERROR"
+
+    if ent >= ENTROPY_THRESHOLD:
+        print(f"[ALERT] HIGH ENTROPY DETECTED: {path} (Entropy={ent:.3f})")
+        return True, f"HIGH_ENTROPY_{ent:.3f}"
+    else:
+        return False, f"NORMAL_{ent:.3f}"
 
 
 def blake2b_file(path, size=64):
@@ -104,7 +134,8 @@ def hash_one(args):
         teeprint(f"[WORKER {pid}] SKIP (not regular): {path}")
         return (path, None)
 
-    return (path, blake2b_file(path))
+    digest = blake2b_file(path)
+    return (path, digest)
 
 
 def load_existing_hashes(hash_file_path):
@@ -112,7 +143,6 @@ def load_existing_hashes(hash_file_path):
     known = {}
     if not os.path.exists(hash_file_path):
         return known
-
     try:
         with open(hash_file_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -162,9 +192,13 @@ def hash_all(root='/', out_file=HASH_FILE, workers=None):
             if digest:
                 if digest in known_hashes:
                     skipped_duplicates += 1
+                    bool_str, reason_str = known_hashes[digest]
                     teeprint(f"[SKIP] duplicate: {path}")
+                    # If duplicate was previously flagged TRUE, alert again
+                    if bool_str.strip().upper() == "TRUE":
+                        print(f"[ALERT] Previously flagged TRUE duplicate detected: {path} ({reason_str})")
                 else:
-                    boolean, reason = check_hash(digest)
+                    boolean, reason = check_hash(path, digest)
                     bool_str = "TRUE" if boolean else "FALSE"
                     out.write(f"{digest} {bool_str} {reason}\n")
                     known_hashes[digest] = (bool_str, reason)
@@ -187,7 +221,6 @@ def hash_all(root='/', out_file=HASH_FILE, workers=None):
                 fut = pool.submit(hash_one, (fpath, skip_mounts))
                 futures.append(fut)
                 submitted += 1
-
                 if submitted % SUBMIT_BATCH == 0:
                     drain(n=SUBMIT_BATCH // 2)
                 heartbeat()
@@ -206,4 +239,4 @@ if __name__ == '__main__':
         outp = sys.argv[2] if len(sys.argv) > 2 else HASH_FILE
         hash_all(root, outp)
     print(f"[INFO] Detailed logs: {DEBUG_LOG}")
-    print(f"[INFO]
+    print(f"[INFO] Hashes written to: {HASH_FILE}")
